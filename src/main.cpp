@@ -16,8 +16,10 @@
 #include <igl/map_vertices_to_circle.h>
 #include <igl/serialize.h>
 /*** insert any libigl headers here ***/
+#include "mutils.h"
 #include "extremalities.h"
 #include "parametrization.h"
+#include "laplace_smoothing.h"
 #include <memory>
 #include <iterator>
 
@@ -43,6 +45,11 @@ std::vector <Eigen::VectorXd> K;
 std::vector <Eigen::MatrixXd> EV;
 std::vector <Eigen::VectorXi> is_regular;
 std::vector <Eigen::VectorXd> extremalities;
+// feature line adj
+std::vector <std::vector <std::vector <int>>> zero_adj;
+std::vector <Eigen::MatrixXd> ZV;
+// ...
+Eigen::MatrixXd *my_basis;
 // Scale for displaying vectors
 double vScale = 0;
 
@@ -86,16 +93,144 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
 
         std::vector <Eigen::VectorXd> smoothed;
         smoothed.resize(K.size());
-        for (int k = 0; k < (int) K.size(); ++ k);
+        for (int k = 0; k < (int) K.size(); ++ k) {
+            GM::compute_laplace_smoothing(V, F, EV[k], extremalities[k], smoothed[k]);
+            extremalities[k] += smoothed[k];
+        }
 
         Eigen::MatrixXd colors;
-        igl::jet(smoothed[0], true, colors);
+        igl::jet(extremalities[0], true, colors);
         viewer.data.set_colors(colors);
     }
 
     if (key == '5') {
+        // Extract Feature Lines
         viewer.data.clear();
         viewer.data.set_mesh(V, F);
+
+        zero_adj.clear();
+        zero_adj.resize(K.size());
+        ZV.resize(K.size());
+        for (int k = 0; k < (int) K.size(); ++ k) {
+            int n_points = 0;
+            std::map <pair <int, int>, int> zero_id;
+            std::vector <Eigen::VectorXd> z;
+            auto k_gradient_cd = GM::get_gradient(V, F, K[k], my_basis);
+            auto k_gradient = GM::to_vector_field(k_gradient_cd, my_basis);
+            for (int f = 0; f < F.rows(); ++ f)
+                if (is_regular[k](f)) {
+                    double sum_k_max = 0, sum_k_min = 0;
+                    Eigen::Vector3d e_slice;
+                    Eigen::Matrix3d ev_slice;
+                    for (int j = 0; j < F.cols(); ++ j) {
+                        int i = F(k, j);
+                        sum_k_max += K[0](i);
+                        sum_k_min += K[1](i);
+                        e_slice(j) = extremalities[k](i);
+                        ev_slice.row(j) = EV[k].row(i);
+                    }
+                    /// make consistent
+                    for (int j = 1; j < F.cols(); ++ j)
+                        if (GM::sgn(ev_slice.row(0).dot(ev_slice.row(j))) < 0) {
+                            e_slice(j) *= -1;
+                            ev_slice.row(j) *= -1;
+                        }
+                    /// check equation (6)
+                    if (k == 0 && GM::sgn(fabs(sum_k_max) - fabs(sum_k_min)) <= 0)
+                        continue;
+                    if (k == 1 && GM::sgn(fabs(sum_k_max) - fabs(sum_k_min)) >= 0)
+                        continue;
+                    /// check equation (5)
+                    auto desired_sign = (k == 0) ? -1 : 1;
+                    double sum_inner_product = 0;
+                    for (int j = 1; j < F.cols(); ++ j)
+                        sum_inner_product += k_gradient.row(f).dot(ev_slice.row(j));
+                    if (GM::sgn(sum_inner_product) != desired_sign)
+                        continue;
+                    /// pass two requirements, see if contains zero sets
+                    auto last_found = -1;
+                    for (int fi1 = 0; fi1 < F.cols(); ++ fi1) {
+                        int fi2 = (fi1 + 1 == F.cols()) ? 0 : fi1 + 1;
+                        if (GM::sgn(e_slice(fi1)) * GM::sgn(e_slice(fi2)) < 0) {
+                            /// found: create a vertex
+                            int point_id;
+                            if (zero_id.count(make_pair(F(f, fi1), F(f, fi2))))
+                                point_id = zero_id[make_pair(F(f, fi1), F(f, fi2))];
+                            else {
+                                /// new point
+                                point_id = n_points;
+                                zero_id[make_pair(F(f, fi1), F(f, fi2))] = zero_id[make_pair(F(f, fi2), F(f, fi1))] = point_id;
+                                ++ n_points;
+                                z.push_back((V.row(F(f, fi1)) * fabs(e_slice(fi2)) + V.row(F(f, fi2)) * fabs(e_slice(fi1))) / (fabs(e_slice(fi2)) + fabs(e_slice(fi1))));
+                                zero_adj[k].push_back(std::vector <int> ());
+                            }
+                            if (last_found != -1) {
+                                /// connect edge
+                                zero_adj[k][point_id].push_back(last_found);
+                                zero_adj[k][last_found].push_back(point_id);
+                            }
+                            last_found = point_id;
+                        }
+                    }
+                }
+            for (int f = 0; f < F.rows(); ++ f)
+                if (!is_regular[k](f)) {
+                    auto total_zeros = 0;
+                    for (int fi1 = 0; fi1 < F.cols(); ++ fi1) {
+                        int fi2 = (fi1 + 1 == F.cols()) ? 0 : fi1 + 1;
+                        if (zero_id.count(make_pair(F(f, fi1), F(f, fi2))))
+                            ++ total_zeros;
+                    }
+                    if (total_zeros == 3) {
+                        /// new point
+                        int point_id = n_points;
+                        ++ n_points;
+                        z.push_back(MF.row(f));
+                        zero_adj[k].push_back(std::vector <int> ());
+                        for (int fi1 = 0; fi1 < F.cols(); ++ fi1) {
+                            int fi2 = (fi1 + 1 == F.cols()) ? 0 : fi1 + 1;
+                            int last_found = zero_id[make_pair(F(f, fi1), F(f, fi2))];
+                            /// connect barycenter
+                            zero_adj[k][point_id].push_back(last_found);
+                            zero_adj[k][last_found].push_back(point_id);
+                        }
+                    } else if (total_zeros == 2) {
+                        int last_found = -1;
+                        for (int fi1 = 0; fi1 < F.cols(); ++ fi1) {
+                            int fi2 = (fi1 + 1 == F.cols()) ? 0 : fi1 + 1;
+                            if (zero_id.count(make_pair(F(f, fi1), F(f, fi2)))) {
+                                int point_id = zero_id[make_pair(F(f, fi1), F(f, fi2))];
+                                if (last_found != - 1) {
+                                    /// connect edge
+                                    zero_adj[k][point_id].push_back(last_found);
+                                    zero_adj[k][last_found].push_back(point_id);
+                                }
+                                last_found = point_id;
+                            }
+                        }
+                    }
+                }
+            cerr << "???" << z.size() << endl;
+            ZV[k] = GM::toEigenMatrix(z);
+        }
+        /// display
+        for (int k = 0; k < (int) K.size(); ++ k) {
+            int total_degree = 0;
+            for (int i = 0; i < ZV[k].rows(); ++ i)
+                total_degree += zero_adj[k][i].size();
+            cerr << total_degree << endl;
+            Eigen::MatrixXd endpoints1(total_degree / 2, ZV[k].cols()), endpoints2(total_degree / 2, ZV[k].cols());
+            for (int i = 0, count = 0; i < ZV[k].rows(); ++ i)
+                for (int j: zero_adj[k][i])
+                    if (i < j) {
+                        endpoints1.row(count) = ZV[k].row(i);
+                        endpoints2.row(count) = ZV[k].row(j);
+                        ++ count;
+                    }
+            auto color = Eigen::RowVector3d(0.1, 0.1, 0.1);
+            color(k) = 0.9;
+            viewer.data.add_edges(endpoints1, endpoints2, color);
+        }
     }
 
     if (key == '6') {
@@ -145,16 +280,15 @@ int main(int argc, char *argv[]) {
     GM::compute_eigens(VS, K, EV);
     is_regular.resize(K.size());
     extremalities.resize(K.size());
-    auto my_basis = GM::get_local_basis(V, F);
+    my_basis = GM::get_local_basis(V, F);
     for (int k = 0; k < (int) K.size(); ++ k) {
-        GM::make_consistent(F, EV[k], is_regular[k]);
         Eigen::VectorXd area_star;
-        GM::compute_area_star(V, F, area_star);
+        GM::compute_is_regular(F, EV[k], is_regular[k]);
+        GM::compute_area_star(V, F, is_regular[k], area_star);
         auto gradient_complex = GM::get_gradient(V, F, 3.0 * K[k].array() / area_star.array(), my_basis);
         auto gradient = GM::to_vector_field(gradient_complex, my_basis);
-        GM::compute_extremalities(V, F, gradient, EV[k], extremalities[k]);
+        GM::compute_extremalities(V, F, gradient, EV[k], is_regular[k], extremalities[k]);
     }
-    delete[] my_basis;
 
     viewer.core.point_size = 10;
 
