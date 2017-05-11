@@ -48,10 +48,13 @@ std::vector <Eigen::VectorXd> extremalities;
 // feature line adj
 std::vector <std::vector <std::vector <int>>> zero_adj;
 std::vector <Eigen::MatrixXd> ZV;
+std::vector <std::vector <double>> ZW;
 // ...
 Eigen::MatrixXd *my_basis;
 // Scale for displaying vectors
 double vScale = 0;
+// Threshold
+double threshold = 1.;
 
 // Function declarations (see below for implementation)
 bool callback_key_down  (Viewer &viewer, unsigned char key, int modifiers);
@@ -95,7 +98,7 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
         smoothed.resize(K.size());
         for (int k = 0; k < (int) K.size(); ++ k) {
             GM::compute_laplace_smoothing(V, F, EV[k], extremalities[k], smoothed[k]);
-            extremalities[k] += smoothed[k];
+            extremalities[k] += 0.01 * smoothed[k];
         }
 
         Eigen::MatrixXd colors;
@@ -111,23 +114,25 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
         zero_adj.clear();
         zero_adj.resize(K.size());
         ZV.resize(K.size());
+        ZW.clear();
+        ZW.resize(K.size());
         for (int k = 0; k < (int) K.size(); ++ k) {
             int n_points = 0;
             std::map <pair <int, int>, int> zero_id;
             std::vector <Eigen::VectorXd> z;
-            auto k_gradient_cd = GM::get_gradient(V, F, K[k], my_basis);
-            auto k_gradient = GM::to_vector_field(k_gradient_cd, my_basis);
             for (int f = 0; f < F.rows(); ++ f)
                 if (is_regular[k](f)) {
                     double sum_k_max = 0, sum_k_min = 0;
                     Eigen::Vector3d e_slice;
                     Eigen::Matrix3d ev_slice;
+                    std::vector <GM::Cd> c;
                     for (int j = 0; j < F.cols(); ++ j) {
-                        int i = F(k, j);
+                        int i = F(f, j);
                         sum_k_max += K[0](i);
                         sum_k_min += K[1](i);
                         e_slice(j) = extremalities[k](i);
                         ev_slice.row(j) = EV[k].row(i);
+                        c.push_back(GM::Cd(V.row(i).dot(my_basis[0].row(f)), V.row(i).dot(my_basis[1].row(f))));
                     }
                     /// make consistent
                     for (int j = 1; j < F.cols(); ++ j)
@@ -135,6 +140,9 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
                             e_slice(j) *= -1;
                             ev_slice.row(j) *= -1;
                         }
+                    /// compute e_gradient
+                    auto e_gradient_cd = GM::get_gradient(c, e_slice);
+                    auto e_gradient = e_gradient_cd.real() * my_basis[0].row(f) + e_gradient_cd.imag() * my_basis[1].row(f);
                     /// check equation (6)
                     if (k == 0 && GM::sgn(fabs(sum_k_max) - fabs(sum_k_min)) <= 0)
                         continue;
@@ -144,7 +152,7 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
                     auto desired_sign = (k == 0) ? -1 : 1;
                     double sum_inner_product = 0;
                     for (int j = 1; j < F.cols(); ++ j)
-                        sum_inner_product += k_gradient.row(f).dot(ev_slice.row(j));
+                        sum_inner_product += e_gradient.dot(ev_slice.row(j));
                     if (GM::sgn(sum_inner_product) != desired_sign)
                         continue;
                     /// pass two requirements, see if contains zero sets
@@ -162,6 +170,7 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
                                 zero_id[make_pair(F(f, fi1), F(f, fi2))] = zero_id[make_pair(F(f, fi2), F(f, fi1))] = point_id;
                                 ++ n_points;
                                 z.push_back((V.row(F(f, fi1)) * fabs(e_slice(fi2)) + V.row(F(f, fi2)) * fabs(e_slice(fi1))) / (fabs(e_slice(fi2)) + fabs(e_slice(fi1))));
+                                ZW[k].push_back((K[k](F(f, fi1)) * fabs(e_slice(fi2)) + K[k](F(f, fi2)) * fabs(e_slice(fi1))) / (fabs(e_slice(fi2)) + fabs(e_slice(fi1))));
                                 zero_adj[k].push_back(std::vector <int> ());
                             }
                             if (last_found != -1) {
@@ -187,13 +196,16 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
                         ++ n_points;
                         z.push_back(MF.row(f));
                         zero_adj[k].push_back(std::vector <int> ());
+                        double w_sum = 0;
                         for (int fi1 = 0; fi1 < F.cols(); ++ fi1) {
                             int fi2 = (fi1 + 1 == F.cols()) ? 0 : fi1 + 1;
                             int last_found = zero_id[make_pair(F(f, fi1), F(f, fi2))];
                             /// connect barycenter
                             zero_adj[k][point_id].push_back(last_found);
                             zero_adj[k][last_found].push_back(point_id);
+                            w_sum += K[k](fi1);
                         }
+                        ZW[k].push_back(w_sum / F.cols());
                     } else if (total_zeros == 2) {
                         int last_found = -1;
                         for (int fi1 = 0; fi1 < F.cols(); ++ fi1) {
@@ -210,7 +222,7 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
                         }
                     }
                 }
-            cerr << "???" << z.size() << endl;
+            cerr << "#points = " << z.size() << endl;
             ZV[k] = GM::toEigenMatrix(z);
         }
         /// display
@@ -218,7 +230,7 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
             int total_degree = 0;
             for (int i = 0; i < ZV[k].rows(); ++ i)
                 total_degree += zero_adj[k][i].size();
-            cerr << total_degree << endl;
+            cerr << "#edges = " << total_degree << endl;
             Eigen::MatrixXd endpoints1(total_degree / 2, ZV[k].cols()), endpoints2(total_degree / 2, ZV[k].cols());
             for (int i = 0, count = 0; i < ZV[k].rows(); ++ i)
                 for (int j: zero_adj[k][i])
@@ -234,8 +246,46 @@ bool callback_key_down(Viewer& viewer, unsigned char key, int modifiers) {
     }
 
     if (key == '6') {
+        // Remove small ridges by a threshold filter
         viewer.data.clear();
         viewer.data.set_mesh(V, F);
+        for (int k = 0; k < (int) K.size(); ++ k) {
+            double kScale = K[k].mean();
+            std::vector <Eigen::VectorXd> endpoints1, endpoints2;
+            for (int i = 0; i < ZV[k].rows(); ++ i)
+                if (zero_adj[k][i].size() != 2) {
+                    /// begin with one endpoint
+                    for (int t: zero_adj[k][i]) {
+                        std::vector <int> points_inside;
+                        points_inside.push_back(i);
+                        int v = t;
+                        while (zero_adj[k][v].size() == 2) {
+                            for (int u: zero_adj[k][v])
+                                if (u != points_inside.back()) {
+                                    points_inside.push_back(v);
+                                    v = u;
+                                    break;
+                                }
+                        }
+                        points_inside.push_back(v);
+                        /// find a line: check threshold
+                        double total_weight = 0.;
+                        for (int j = 0; j + 1 < (int) points_inside.size(); ++ j) {
+                            total_weight += 0.5 * (ZW[k][points_inside[j]] + ZW[k][points_inside[j + 1]]) * (ZV[k].row(points_inside[j]) - ZV[k].row(points_inside[j + 1])).norm();
+                        }
+                        if ((k == 0 && total_weight > threshold * vScale * kScale) || (k == 1 && total_weight < threshold * vScale * kScale)) {
+                            for (int j = 0; j + 1 < (int) points_inside.size(); ++ j)
+                                if (points_inside[j] < points_inside[j + 1]) {
+                                    endpoints1.push_back(ZV[k].row(points_inside[j]));
+                                    endpoints2.push_back(ZV[k].row(points_inside[j + 1]));
+                                }
+                        }
+                    }
+                }
+            auto color = Eigen::RowVector3d(0.1, 0.1, 0.1);
+            color(k) = 0.9;
+            viewer.data.add_edges(GM::toEigenMatrix(endpoints1), GM::toEigenMatrix(endpoints2), color);
+        }
     }
 
     return true;
@@ -256,8 +306,8 @@ int main(int argc, char *argv[]) {
     callback_key_down(viewer, '1', 0);
 
     viewer.callback_init = [&](Viewer &v) {
+        v.ngui->addVariable("Threshold", threshold);
         v.screen->performLayout();
-
         return false;
     };
 
@@ -288,6 +338,7 @@ int main(int argc, char *argv[]) {
         auto gradient_complex = GM::get_gradient(V, F, 3.0 * K[k].array() / area_star.array(), my_basis);
         auto gradient = GM::to_vector_field(gradient_complex, my_basis);
         GM::compute_extremalities(V, F, gradient, EV[k], is_regular[k], extremalities[k]);
+//        K[k] = 3.0 * K[k].array() / area_star.array();
     }
 
     viewer.core.point_size = 10;
