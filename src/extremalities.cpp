@@ -32,14 +32,12 @@ void GM::compute_shape_operators(const Eigen::MatrixXd &V, const Eigen::MatrixXi
                 auto common_edge = V.row(vi2) - V.row(vi1);
                 Eigen::Vector3d e_unit = common_edge.normalized();
                 /// mean curvature = 2 |e| cos(x / 2)
-                /// cos(x/2) = (+/-) sqrt((1 + cos(x)) / 2)
+                /// cos(x/2) = sqrt((1 + cos(x)) / 2)
                 /// first compute cos(x):
                 auto fn1 = FN.row(f1);
                 auto fn2 = FN.row(f2);
                 auto cos_x = - fn1.dot(fn2) / (fn1.norm() * fn2.norm());
                 auto cos_half = sqrt(std::max((1. + cos_x) / 2, 0.));
-                if (cos_x < 0)
-                    cos_half = - cos_half;
                 auto mean_curvature = 2. * common_edge.norm() * cos_half;
                 /// edge normal = (N1 + N2) / || N1 + N2 ||
                 Eigen::Vector3d edge_normal = (VN.row(vi1) + VN.row(vi2)).normalized();
